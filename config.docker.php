@@ -51,6 +51,7 @@ $db['user']    = file_env('IPAM_DATABASE_USER',    $db['user']);
 $db['pass']    = file_env('IPAM_DATABASE_PASS',    $db['pass']);
 $db['name']    = file_env('IPAM_DATABASE_NAME',    $db['name']);
 $db['port']    = file_env('IPAM_DATABASE_PORT',    $db['port']);
+$db['type']    = file_env('IPAM_DATABASE_TYPE',    $db['type']);
 $db['webhost'] = file_env('IPAM_DATABASE_WEBHOST', $db['webhost']);
 
 /**

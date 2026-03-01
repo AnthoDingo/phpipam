@@ -147,17 +147,25 @@ class Install extends Common_functions {
 		$esc_pass = addcslashes($this->db['pass'],"'");
 		$db_name  = $this->db['name'];
 		$webhost  = is_string(@$this->db['webhost']) && !is_blank(@$this->db['webhost']) ? addcslashes($this->db['webhost'],"'") : 'localhost';
+		$db_type  = isset($this->db['type']) ? $this->db['type'] : 'mysql';
 
 		try {
-			# Check if user exists;
-			$result = $this->Database_root->getObjectQuery("no_html_escape", "SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = '$esc_user' AND host = '$webhost') AS user_exists;");
+			if ($db_type === 'mysql') {
+				# Check if user exists;
+				$result = $this->Database_root->getObjectQuery("no_html_escape", "SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = '$esc_user' AND host = '$webhost') AS user_exists;");
 
-			# create user if not exists and set permissions
-			if ($result->user_exists == 0) {
-				$this->Database_root->runQuery("CREATE USER '$esc_user'@'$webhost' IDENTIFIED BY '$esc_pass';");
+				# create user if not exists and set permissions
+				if ($result->user_exists == 0) {
+					$this->Database_root->runQuery("CREATE USER '$esc_user'@'$webhost' IDENTIFIED BY '$esc_pass';");
+				}
+				$this->Database_root->runQuery("GRANT ALL ON `$db_name`.* TO '$esc_user'@'$webhost';");
+				$this->Database_root->runQuery("FLUSH PRIVILEGES;");
+			} else {
+				# SQL Server grants
+				$this->Database_root->runQuery("IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = '$esc_user') BEGIN CREATE LOGIN [$esc_user] WITH PASSWORD = '$esc_pass' END;");
+				$this->Database_root->runQuery("USE [$db_name]; IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = '$esc_user') BEGIN CREATE USER [$esc_user] FOR LOGIN [$esc_user] END;");
+				$this->Database_root->runQuery("USE [$db_name]; ALTER ROLE db_owner ADD MEMBER [$esc_user];");
 			}
-			$this->Database_root->runQuery("GRANT ALL ON `$db_name`.* TO '$esc_user'@'$webhost';");
-			$this->Database_root->runQuery("FLUSH PRIVILEGES;");
 
 		} catch (Exception $e) { $this->Result->show("danger", $e->getMessage(), true); }
 	}
@@ -171,11 +179,14 @@ class Install extends Common_functions {
 	 */
 	private function install_database_execute ($migrate = false) {
 	    # import SCHEMA file queries
+		$db_type = isset($this->db['type']) ? $this->db['type'] : 'mysql';
+		$ext = ($db_type === 'sqlsrv') ? '.sqlsrv.sql' : '.sql';
+
 	    if($migrate) {
-		    $query  = file_get_contents("../../db/MIGRATE.sql");
+		    $query  = file_get_contents("../../db/MIGRATE" . ($db_type === 'sqlsrv' ? '.sqlsrv' : '') . ".sql");
 		}
 		else {
-		    $query  = file_get_contents("../../db/SCHEMA.sql");
+		    $query  = file_get_contents("../../db/SCHEMA" . ($db_type === 'sqlsrv' ? '.sqlsrv' : '') . ".sql");
 		}
 
 	    # formulate queries
@@ -253,7 +264,12 @@ class Install extends Common_functions {
 	 */
 	public function check_table ($table, $redirect = false) {
 		# set query
-		$query = "SELECT COUNT(*) AS `cnt` FROM information_schema.tables WHERE table_schema = '" . $this->db['name'] . "' AND table_name = '$table';";
+		$db_type = isset($this->db['type']) ? $this->db['type'] : 'mysql';
+		if ($db_type === 'mysql') {
+			$query = "SELECT COUNT(*) AS `cnt` FROM information_schema.tables WHERE table_schema = '" . $this->db['name'] . "' AND table_name = '$table';";
+		} else {
+			$query = "SELECT COUNT(*) AS [cnt] FROM information_schema.tables WHERE table_catalog = '" . $this->db['name'] . "' AND table_name = '$table';";
+		}
 		# try to fetch count
 		try {
 			$result = $this->Database->getObjectQuery("no_html_escape", $query);
