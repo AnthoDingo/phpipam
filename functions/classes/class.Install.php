@@ -179,11 +179,14 @@ class Install extends Common_functions {
 	 */
 	private function install_database_execute ($migrate = false) {
 	    # import SCHEMA file queries
+		$db_type = isset($this->db['type']) ? $this->db['type'] : 'mysql';
+		$ext = ($db_type === 'sqlsrv') ? '.sqlsrv.sql' : '.sql';
+
 	    if($migrate) {
-		    $query  = file_get_contents("../../db/MIGRATE.sql");
+		    $query  = file_get_contents("../../db/MIGRATE" . ($db_type === 'sqlsrv' ? '.sqlsrv' : '') . ".sql");
 		}
 		else {
-		    $query  = file_get_contents("../../db/SCHEMA.sql");
+		    $query  = file_get_contents("../../db/SCHEMA" . ($db_type === 'sqlsrv' ? '.sqlsrv' : '') . ".sql");
 		}
 
 	    # formulate queries
