@@ -13,6 +13,7 @@ $db['user'] = 'phpipam';
 $db['pass'] = 'phpipamadmin';
 $db['name'] = 'phpipam';
 $db['port'] = 3306;
+$db['type'] = 'mysql';
 
 /**
  * Database webhost settings

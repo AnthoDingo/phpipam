@@ -146,6 +146,14 @@ abstract class DB {
 	protected $debug = false;
 
 	/**
+	 * Database type
+	 *
+	 * @var string
+	 * @access protected
+	 */
+	protected $db_type = 'mysql';
+
+	/**
 	 * __construct function.
 	 *
 	 * @access public
@@ -225,6 +233,76 @@ abstract class DB {
 	}
 
 	/**
+	 * Rewrite query for different database dialects
+	 *
+	 * @param  string $query
+	 * @return string
+	 */
+	protected function rewriteQuery($query) {
+		if ($this->db_type === 'mysql') {
+			return $query;
+		}
+
+		if ($this->db_type === 'sqlsrv') {
+			// Replace backticks with double quotes, but only if they are not part of a string literal
+			// Extremely basic heuristic: only if not preceded/followed by single quote or if even number of single quotes before.
+			// Better: replace only if it surrounds an identifier.
+			$query = preg_replace('/`([^`]+)`/', '"$1"', $query);
+
+			// LPAD(field, len, 0) -> RIGHT(REPLICATE('0', len) + CAST(field AS VARCHAR(len)), len)
+			$query = preg_replace('/LPAD\(([^,]+),\s*(\d+),\s*0\)/', "RIGHT(REPLICATE('0', \$2) + CAST(\$1 AS VARCHAR(\$2)), \$2)", $query);
+
+			// IF(cond, true, false) -> CASE WHEN cond THEN true ELSE false END
+			$query = preg_replace('/IF\(([^,]+),\s*([^,]+),\s*([^)]+)\)/', "(CASE WHEN \$1 THEN \$2 ELSE \$3 END)", $query);
+
+			// WITH RECURSIVE -> WITH
+			$query = preg_replace('/WITH\s+RECURSIVE/i', 'WITH', $query);
+
+			// Schema translation for CREATE TABLE
+			if (stripos($query, 'CREATE TABLE') !== false) {
+				// AUTO_INCREMENT -> IDENTITY(1,1)
+				$query = preg_replace('/AUTO_INCREMENT/i', 'IDENTITY(1,1)', $query);
+				// unsigned -> (remove)
+				$query = preg_replace('/unsigned/i', '', $query);
+				// ENGINE=... -> (remove)
+				$query = preg_replace('/\) ENGINE=[^;]+;/', ');', $query);
+				// SET('val1','val2') -> VARCHAR(max)
+				$query = preg_replace('/set\([^)]+\)/i', 'VARCHAR(255)', $query);
+				// ENUM('val1','val2') -> VARCHAR(max)
+				$query = preg_replace('/enum\([^)]+\)/i', 'VARCHAR(255)', $query);
+				// BINARY(1) -> BIT
+				$query = preg_replace('/BINARY\(1\)/i', 'BIT', $query);
+			}
+
+			// VERSION() -> @@VERSION
+			$query = str_ireplace('VERSION()', '@@VERSION', $query);
+
+			// CHAR_LENGTH -> LEN
+			$query = str_ireplace('CHAR_LENGTH(', 'LEN(', $query);
+
+			// NOW() -> GETDATE()
+			$query = str_ireplace('NOW()', 'GETDATE()', $query);
+
+			// DATE_SUB(GETDATE(), INTERVAL 1 DAY) -> DATEADD(day, -1, GETDATE())
+			$query = preg_replace('/DATE_SUB\(([^,]+),\s*INTERVAL\s+(\d+)\s+DAY\)/i', "DATEADD(day, -$2, $1)", $query);
+			$query = preg_replace('/DATE_SUB\(([^,]+),\s*INTERVAL\s+(\d+)\s+MINUTE\)/i', "DATEADD(minute, -$2, $1)", $query);
+
+			// LIMIT/OFFSET
+			if (preg_match('/LIMIT\s+(\d+)(?:\s+OFFSET\s+(\d+))?/i', $query, $matches)) {
+				$limit = $matches[1];
+				$offset = isset($matches[2]) ? $matches[2] : 0;
+				$replacement = "OFFSET $offset ROWS FETCH NEXT $limit ROWS ONLY";
+				if (stripos($query, 'ORDER BY') === false) {
+					$replacement = "ORDER BY (SELECT NULL) " . $replacement;
+				}
+				$query = preg_replace('/LIMIT\s+\d+(?:\s+OFFSET\s+\d+)?/i', $replacement, $query);
+			}
+		}
+
+		return $query;
+	}
+
+	/**
 	 * Connect to the database
 	 * Call whenever a connection is needed to be made
 	 *
@@ -249,11 +327,13 @@ abstract class DB {
 			throw new Exception ("Could not connect to database! ".$e->getMessage());
 		}
 
-		try {
-			$this->pdo->query('SET NAMES \'' . $this->charset . '\';');
-			$this->set_names = true;
-		} catch (Exception $e) {
-			$this->set_names = false;
+		if ($this->db_type === 'mysql') {
+			try {
+				$this->pdo->query('SET NAMES \'' . $this->charset . '\';');
+				$this->set_names = true;
+			} catch (Exception $e) {
+				$this->set_names = false;
+			}
 		}
 	}
 
@@ -415,6 +495,7 @@ abstract class DB {
 
 		$result = null;
 
+		$query = $this->rewriteQuery($query);
 		$statement = $this->pdo->prepare($query);
 
 		//debug
@@ -521,7 +602,8 @@ abstract class DB {
 		if (!$this->isConnected()) $this->connect();
 
 		$tableName = $this->escape($tableName);
-		$statement = $this->pdo->prepare('SELECT COUNT(*) as `num` FROM `'.$tableName.'`;');
+		$query = $this->rewriteQuery('SELECT COUNT(*) as `num` FROM `'.$tableName.'`;');
+		$statement = $this->pdo->prepare($query);
 
 		//debug
 		$this->log_query ($statement);
@@ -546,7 +628,8 @@ abstract class DB {
 		$like === true ? $operator = "LIKE" : $operator = "=";
 
 		$tableName = $this->escape($tableName);
-		$statement = $this->pdo->prepare('SELECT COUNT(*) as `num` FROM `'.$tableName.'` where `'.$method.'` '.$operator.' ?;');
+		$query = $this->rewriteQuery('SELECT COUNT(*) as `num` FROM `'.$tableName.'` where `'.$method.'` '.$operator.' ?;');
+		$statement = $this->pdo->prepare($query);
 
 		//debug
 		$this->log_query ($statement, (array) $value);
@@ -609,9 +692,12 @@ abstract class DB {
 
 		//primary key 2?
 		if(!is_null($primarykey2))
-		$statement = $this->pdo->prepare('UPDATE `' . $tableName . '` SET ' . $preparedParamStr . ' WHERE `' . $primarykey . '`=? AND `' . $primarykey2 . '`=?;');
+		$query = 'UPDATE `' . $tableName . '` SET ' . $preparedParamStr . ' WHERE `' . $primarykey . '`=? AND `' . $primarykey2 . '`=?;';
 		else
-		$statement = $this->pdo->prepare('UPDATE `' . $tableName . '` SET ' . $preparedParamStr . ' WHERE `' . $primarykey . '`=?;');
+		$query = 'UPDATE `' . $tableName . '` SET ' . $preparedParamStr . ' WHERE `' . $primarykey . '`=?;';
+
+		$query = $this->rewriteQuery($query);
+		$statement = $this->pdo->prepare($query);
 
 		//merge the parameters and values
 		$paramValues = array_merge(array_values($obj), $objId);
@@ -687,10 +773,51 @@ abstract class DB {
 		$preparedValuesStr = implode(', ', array_fill(0, count($objValues), '?'));
 
 		if ($replace) {
-			$statement = $this->pdo->prepare('REPLACE INTO `' . $tableName . '` (' . $preparedParamsStr . ') VALUES (' . $preparedValuesStr . ');');
+			if ($this->db_type === 'sqlsrv') {
+				// SQL Server MERGE for REPLACE INTO emulation
+				// This assumes a single primary key 'id' if not provided otherwise.
+				// For phpipam, most tables have 'id' as PK.
+				$pks = ['id'];
+				if ($tableName == 'sections') $pks = ['name'];
+				if ($tableName == 'vlanDomains') $pks = ['id'];
+				if ($tableName == 'vrf') $pks = ['vrfId'];
+				if ($tableName == 'vlans') $pks = ['vlanId'];
+
+				$on_clause = [];
+				foreach ($pks as $pk) {
+					if (array_key_exists($pk, $obj)) {
+						$on_clause[] = "target.\"$pk\" = source.\"$pk\"";
+					}
+				}
+				$on_clause_str = empty($on_clause) ? "1=0" : implode(" AND ", $on_clause);
+
+				$update_clause = [];
+				foreach ($obj as $key => $value) {
+					if (!in_array($key, $pks)) {
+						$update_clause[] = "target.\"$key\" = source.\"$key\"";
+					}
+				}
+				$update_clause_str = implode(", ", $update_clause);
+
+				$query = "MERGE INTO \"$tableName\" AS target
+						  USING (SELECT " . implode(", ", array_fill(0, count($objValues), "?")) . ") AS source (" . implode(", ", array_map(function($k){return "\"$k\"";}, array_keys($obj))) . ")
+						  ON ($on_clause_str)
+						  WHEN MATCHED THEN
+							  UPDATE SET $update_clause_str
+						  WHEN NOT MATCHED THEN
+							  INSERT (" . implode(", ", array_map(function($k){return "\"$k\"";}, array_keys($obj))) . ")
+							  VALUES (" . implode(", ", array_map(function($k){return "source.\"$k\"";}, array_keys($obj))) . ");";
+				// Values need to be doubled because they are used in both USING and UPDATE/INSERT?
+				// Actually, the USING SELECT ? ? ? already maps them to source.
+			} else {
+				$query = 'REPLACE INTO `' . $tableName . '` (' . $preparedParamsStr . ') VALUES (' . $preparedValuesStr . ');';
+			}
 		} else {
-			$statement = $this->pdo->prepare('INSERT INTO `' . $tableName . '` (' . $preparedParamsStr . ') VALUES (' . $preparedValuesStr . ');');
+			$query = 'INSERT INTO `' . $tableName . '` (' . $preparedParamsStr . ') VALUES (' . $preparedValuesStr . ');';
 		}
+
+		$query = $this->rewriteQuery($query);
+		$statement = $this->pdo->prepare($query);
 
 		//run the update on the object
 		if (!$statement->execute($objValues)) {
@@ -794,10 +921,12 @@ abstract class DB {
 
 		if ($numRecords === null) {
 			//get all (no limit)
-			$statement = $this->pdo->query('SELECT * FROM `'.$tableName.'` ORDER BY `'.$sortField.'` '.$sortStr.';');
+			$query = $this->rewriteQuery('SELECT * FROM `'.$tableName.'` ORDER BY `'.$sortField.'` '.$sortStr.';');
+			$statement = $this->pdo->query($query);
 		} else {
 			//get a limited range of objects
-			$statement = $this->pdo->query('SELECT * FROM `'.$tableName.'` ORDER BY `'.$sortField.'` '.$sortStr.' LIMIT '.$numRecords.' OFFSET '.$offset.';');
+			$query = $this->rewriteQuery('SELECT * FROM `'.$tableName.'` ORDER BY `'.$sortField.'` '.$sortStr.' LIMIT '.$numRecords.' OFFSET '.$offset.';');
+			$statement = $this->pdo->query($query);
 		}
 
 		$results = array();
@@ -822,6 +951,7 @@ abstract class DB {
 	public function getObjectsQuery($tableName, $query = null, $values = array(), $class = 'stdClass') {
 		if (!$this->isConnected()) $this->connect();
 
+		$query = $this->rewriteQuery($query);
 		$statement = $this->pdo->prepare($query);
 
 		//debug
@@ -847,7 +977,8 @@ abstract class DB {
 	public function getGroupBy($tableName, $groupField = 'id') {
 		if (!$this->isConnected()) $this->connect();
 
-		$statement = $this->pdo->prepare("SELECT `$groupField`,COUNT(*) FROM `$tableName` GROUP BY `$groupField`");
+		$query = $this->rewriteQuery("SELECT `$groupField`,COUNT(*) FROM `$tableName` GROUP BY `$groupField` ");
+		$statement = $this->pdo->prepare($query);
 
 		//debug
 		$this->log_query ($statement, array());
@@ -880,10 +1011,14 @@ abstract class DB {
 
 		//prepare a statement to get a single object from the database
 		if ($id !== null) {
-			$statement = $this->pdo->prepare('SELECT * FROM `'.$tableName.'` WHERE `id`=? LIMIT 1;');
+			$query = 'SELECT * FROM `'.$tableName.'` WHERE `id`=? LIMIT 1;';
+			$query = $this->rewriteQuery($query);
+			$statement = $this->pdo->prepare($query);
 			$statement->bindParam(1, $id, \PDO::PARAM_INT);
 		} else {
-			$statement = $this->pdo->prepare('SELECT * FROM `'.$tableName.'` LIMIT 1;');
+			$query = 'SELECT * FROM `'.$tableName.'` LIMIT 1;';
+			$query = $this->rewriteQuery($query);
+			$statement = $this->pdo->prepare($query);
 		}
 
 		//debug
@@ -913,6 +1048,7 @@ abstract class DB {
 	public function getObjectQuery($tableName, $query = null, $values = array(), $class = 'stdClass') {
 		if (!$this->isConnected()) $this->connect();
 
+		$query = $this->rewriteQuery($query);
 		$statement = $this->pdo->prepare($query);
 		//debug
 		$this->log_query ($statement, $values);
@@ -1186,6 +1322,7 @@ class Database_PDO extends DB {
 		$this->username = $db['user'];
 		$this->password = $db['pass'];
 		$this->dbname 	= $db['name'];
+		$this->db_type  = isset($db['type']) ? $db['type'] : 'mysql';
 
 		$this->ssl = false;
 		if (@$db['ssl']===true) {
@@ -1232,9 +1369,16 @@ class Database_PDO extends DB {
 	 * @return string
 	 */
 	protected function makeDsn() {
-		# for installation
-		if($this->install)	{ return 'mysql:host=' . $this->host . ';port=' . $this->port . ';charset=' . $this->charset; }
-		else				{ return 'mysql:host=' . $this->host . ';port=' . $this->port . ';dbname=' . $this->dbname . ';charset=' . $this->charset; }
+		if ($this->db_type === 'mysql') {
+			# for installation
+			if($this->install)	{ return 'mysql:host=' . $this->host . ';port=' . $this->port . ';charset=' . $this->charset; }
+			else				{ return 'mysql:host=' . $this->host . ';port=' . $this->port . ';dbname=' . $this->dbname . ';charset=' . $this->charset; }
+		}
+		elseif ($this->db_type === 'sqlsrv') {
+			# for installation
+			if($this->install)	{ return 'sqlsrv:Server=' . $this->host . ',' . $this->port; }
+			else				{ return 'sqlsrv:Server=' . $this->host . ',' . $this->port . ';Database=' . $this->dbname; }
+		}
 	}
 
 	/**
@@ -1244,11 +1388,26 @@ class Database_PDO extends DB {
 	 * @return array
 	 */
 	public function getColumnInfo() {
-		$columns = $this->getObjectsQuery("no_html_escape",
-			"SELECT `table_name`, `column_name`, `column_default`, `is_nullable`, `data_type`,`column_key`, `extra`
-			FROM `columns`
-			WHERE `table_schema`='" . $this->dbname . "';
-		");
+		if ($this->db_type === 'mysql') {
+			$query = "SELECT `table_name`, `column_name`, `column_default`, `is_nullable`, `data_type`,`column_key`, `extra`
+				FROM `columns`
+				WHERE `table_schema`='" . $this->dbname . "';
+			";
+		} else {
+			$query = "SELECT c.table_name, c.column_name, c.column_default, c.is_nullable, c.data_type,
+					  (CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' ELSE '' END) AS column_key,
+					  (CASE WHEN COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1 THEN 'auto_increment' ELSE '' END) AS extra
+				FROM information_schema.columns c
+				LEFT JOIN (
+					SELECT ku.table_catalog, ku.table_schema, ku.table_name, ku.column_name
+					FROM information_schema.table_constraints tc
+					JOIN information_schema.key_column_usage ku ON tc.constraint_name = ku.constraint_name
+					WHERE tc.constraint_type = 'PRIMARY KEY'
+				) pk ON c.table_catalog = pk.table_catalog AND c.table_schema = pk.table_schema AND c.table_name = pk.table_name AND c.column_name = pk.column_name
+				WHERE c.table_catalog='" . $this->dbname . "';
+			";
+		}
+		$columns = $this->getObjectsQuery("no_html_escape", $query);
 
 		$columnsByTable = array();
 
@@ -1279,7 +1438,22 @@ class Database_PDO extends DB {
     	$tableName = $this->escape($tableName);
     	$field = $this->escape($field);
     	// fetch and return
-    	return $this->getObjectQuery("no_html_escape", "SHOW FIELDS FROM `$tableName` where Field = ?", array($field));
+		if ($this->db_type === 'mysql') {
+		return $this->getObjectQuery("no_html_escape", "SHOW FIELDS FROM `$tableName` where Field = ?", array($field));
+		} else {
+			return $this->getObjectQuery("no_html_escape", "SELECT c.column_name as Field, c.data_type as Type, c.is_nullable as [Null],
+					  (CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' ELSE '' END) AS [Key],
+					  c.column_default as [Default],
+					  (CASE WHEN COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1 THEN 'auto_increment' ELSE '' END) AS Extra
+				FROM information_schema.columns c
+				LEFT JOIN (
+					SELECT ku.table_catalog, ku.table_schema, ku.table_name, ku.column_name
+					FROM information_schema.table_constraints tc
+					JOIN information_schema.key_column_usage ku ON tc.constraint_name = ku.constraint_name
+					WHERE tc.constraint_type = 'PRIMARY KEY'
+				) pk ON c.table_catalog = pk.table_catalog AND c.table_schema = pk.table_schema AND c.table_name = pk.table_name AND c.column_name = pk.column_name
+				WHERE c.table_name = ? AND c.column_name = ? AND c.table_catalog = ?;", array($tableName, $field, $this->dbname));
+		}
 	}
 
 	/**
@@ -1289,12 +1463,20 @@ class Database_PDO extends DB {
 	 * @return array
 	 */
 	public function getForeignKeyInfo() {
-		$foreignLinks = $this->getObjectsQuery("no_html_escape",
-			"SELECT i.`table_name`, k.`column_name`, i.`constraint_type`, i.`constraint_name`, k.`referenced_table_name`, k.`referenced_column_name`
-			FROM `table_constraints` i
-			LEFT JOIN `key_column_usage` k ON i.`constraint_name` = k.`constraint_name`
-			WHERE i.`constraint_type` = 'FOREIGN KEY' AND i.`table_schema`='" . $this->dbname . "';
-			");
+		if ($this->db_type === 'mysql') {
+			$query = "SELECT i.`table_name`, k.`column_name`, i.`constraint_type`, i.`constraint_name`, k.`referenced_table_name`, k.`referenced_column_name`
+				FROM `table_constraints` i
+				LEFT JOIN `key_column_usage` k ON i.`constraint_name` = k.`constraint_name`
+				WHERE i.`constraint_type` = 'FOREIGN KEY' AND i.`table_schema`='" . $this->dbname . "';
+				";
+		} else {
+			$query = "SELECT i.table_name, k.column_name, i.constraint_type, i.constraint_name, k.referenced_table_name, k.referenced_column_name
+				FROM information_schema.table_constraints i
+				LEFT JOIN information_schema.key_column_usage k ON i.constraint_name = k.constraint_name
+				WHERE i.constraint_type = 'FOREIGN KEY' AND i.table_catalog='" . $this->dbname . "';
+				";
+		}
+		$foreignLinks = $this->getObjectsQuery("no_html_escape", $query);
 
 		$foreignLinksByTable = array();
 		$foreignLinksByRefTable = array();

@@ -187,7 +187,7 @@ class Common_functions  {
 	 */
 	public function fetch_mysql_version () {
 		# fetch
-		try { $result = $this->Database->getObjectQuery("no_html_escape", "SELECT VERSION() AS 'version';"); }
+		try { $result = $this->Database->getObjectQuery("no_html_escape", "SELECT @@VERSION AS 'version';"); }
 		catch (Exception $e) {
 			return "";
 		}
